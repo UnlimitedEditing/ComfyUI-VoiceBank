@@ -104,6 +104,7 @@ class VoiceCast:
     def INPUT_TYPES(cls):
         optional = {"audio%d" % i: ("STRING", {"default": "", "tooltip": "Reference audio file for speaker %d" % i})
                     for i in range(1, MAX_VOICES + 1)}
+        optional["init_audio"] = ("STRING", {"default": "", "tooltip": "Telegram: audio you replied to (any form); speaker 1 when audio1 is empty"})
         optional["init_audio_filename"] = ("STRING", {"default": "", "tooltip": "Telegram: audio you replied to; used as speaker 1 when audio1 is empty"})
         optional["init_audio_url"] = ("STRING", {"default": "", "tooltip": "Same, URL form; used when audio1 and init_audio_filename are empty"})
         optional["asr_model"] = ("STRING", {"default": ASR_FILE, "tooltip": "models/asr file used to transcribe your audio"})
@@ -120,14 +121,15 @@ class VoiceCast:
     CATEGORY = "audio/voicebank"
 
     def cast(self, codec, prompt, pick=0, semantic=0, asr_model=ASR_FILE, init_audio_filename="", init_audio_url="",
-             **audio_files):
+             init_audio="", **audio_files):
         text, speakers, descriptions = parse_script(prompt)
         if not text:
             raise ValueError("VoiceCast: the prompt has no text to speak")
         clones = {i: audio_files.get("audio%d" % i, "").strip() for i in range(1, MAX_VOICES + 1)}
         clones = {i: name for i, name in clones.items() if name}
-        if 1 not in clones and (init_audio_filename.strip() or init_audio_url.strip()):
-            clones[1] = init_audio_filename.strip() or init_audio_url.strip()  # replied-to audio is speaker 1
+        replied = next((x.strip() for x in (init_audio_filename, init_audio_url, init_audio) if x and x.strip()), "")
+        if 1 not in clones and replied:
+            clones[1] = replied  # replied-to audio is speaker 1
         # a speaker with an audio file keeps it; a description only matters for speakers without one
         wanted = {s: d for s, d in descriptions.items() if s not in clones}
         bank = pick_bank_voices(wanted, pick, bool(semantic))
