@@ -1,6 +1,7 @@
 """VoiceBankLookup: free-text voice description -> best match in the TTS-AGI moss-character-reference-voices
 dataset (1336 synthetic voices, CC-BY-4.0) -> its reference clip as AUDIO. The voice index (voices.json) and the
-dataset's own embeddings (emb.npy) are bundled; only the chosen ~60 KB mp3 is fetched at run time.
+dataset's own embeddings (emb.npy) are bundled, plus a Whisper large-v3 transcript of every reference clip (the dataset has none, and
+cloners such as Drama 3 need the exact words); only the chosen ~60 KB mp3 is fetched at run time.
 
 Matching = BM25 over the dataset's search_text, plus a timbre match (the dataset scores each voice 0-5 for roughness,
 brightness, chest voice, ...) and an age match; the optional semantic mode adds embedding similarity."""
@@ -169,8 +170,8 @@ class VoiceBankLookup:
                                  "tooltip": "1 adds embedding similarity (bge-large, the model the dataset was embedded with)"}),
         }}
 
-    RETURN_TYPES = ("AUDIO", "STRING", "STRING", "STRING")
-    RETURN_NAMES = ("reference_audio", "text", "voice_name", "voice_id")
+    RETURN_TYPES = ("AUDIO", "STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("reference_audio", "text", "voice_name", "voice_id", "transcript")
     FUNCTION = "lookup"
     CATEGORY = "audio/voicebank"
 
@@ -184,6 +185,8 @@ class VoiceBankLookup:
         if not ranked:
             raise ValueError("VoiceBank: no voices matched the description")
         score, voice = ranked[min(pick, len(ranked) - 1)]
+        if not voice.get("transcript"):
+            raise ValueError(f"VoiceBank: no transcript bundled for {voice['cid']}; voices.json needs the transcripts merged in")
         import folder_paths
         cache = os.path.join(folder_paths.get_temp_directory(), "voicebank")
         os.makedirs(cache, exist_ok=True)
@@ -193,7 +196,7 @@ class VoiceBankLookup:
         wave, rate = decode_clip(path)
         print(f"VoiceBank: '{description}' -> {voice['cid']} '{voice['name']}' ({voice['gender']}, {voice['age']}) "
               f"score {score:.2f}, semantic={bool(semantic)}")
-        return ({"waveform": wave[None], "sample_rate": rate}, text, voice["name"], voice["cid"])
+        return ({"waveform": wave[None], "sample_rate": rate}, text, voice["name"], voice["cid"], voice["transcript"])
 
 
 NODE_CLASS_MAPPINGS = {"VoiceBankLookup": VoiceBankLookup}
