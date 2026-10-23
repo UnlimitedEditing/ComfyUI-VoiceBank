@@ -119,8 +119,11 @@ def rank(query, semantic=False, k1=1.5, b=0.75):
         target_age = next((AGE_WORDS[t] for t in q if t in AGE_WORDS), None)
     wants = [d for t in q for d in TIMBRE_WORDS.get(t, [])]
     n = len(ix["voices"])
+    # a cloner needs the clip's exact words: voices without a usable transcript (k439 is non-speech noise) are never picked
+    transcribed = any(v.get("transcript") for v in ix["voices"])
     keep = [i for i, v in enumerate(ix["voices"])
-            if not want or (v.get("gender") or "").lower().replace("masculine", "male") == want]
+            if (not transcribed or v.get("transcript"))
+            and (not want or (v.get("gender") or "").lower().replace("masculine", "male") == want)]
     bm = []
     for i in keep:
         doc, length, score = ix["docs"][i], ix["lengths"][i], 0.0
