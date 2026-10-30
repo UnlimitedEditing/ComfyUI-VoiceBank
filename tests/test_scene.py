@@ -49,6 +49,34 @@ try:
 except scene.AlignmentError as e:
     print("ok error:", e)
 
+# two voices, short gaps between turns (0.15 s) but LONG pauses inside a turn (0.5 s): pauses alone cannot solve this
+def voice(f0, seconds):
+    n = int(seconds * SR); x = np.zeros(n, np.float32); tt = np.arange(n) / SR
+    for h in range(1, 12):
+        x += np.sin(2 * np.pi * f0 * h * tt) / h
+    return x * 0.2 * (1 + 0.3 * np.sin(2 * np.pi * 3 * tt))
+
+def turn(f0, phrases):
+    parts = []
+    for i, d in enumerate(phrases):
+        parts.append(voice(f0, d))
+        if i < len(phrases) - 1:
+            parts.append(np.zeros(int(0.5 * SR), np.float32))
+    return np.concatenate(parts)
+
+plan = [(110, [1.0, 1.2]), (300, [1.5]), (110, [0.8, 0.9, 0.7]), (300, [1.0, 1.1]), (110, [1.3])]
+parts, truth2v, t0 = [], [], 0.0
+for f0, ph in plan:
+    seg = turn(f0, ph); parts.append(seg); truth2v.append((t0, t0 + len(seg) / SR)); t0 += len(seg) / SR
+    parts.append(np.zeros(int(0.15 * SR), np.float32)); t0 += 0.15
+two = np.concatenate(parts)[None]
+sp = [1, 2, 1, 2, 1]
+spans_v = scene.find_turns(two, SR, 5, sp, [10, 8, 12, 9, 6])
+for (a, b), (ta, tb) in zip(spans_v, truth2v):
+    assert abs(a - ta) < 0.1 and abs(b - tb) < 0.1, (spans_v, truth2v)
+gap_only = scene.find_turns(two, SR, 5)
+assert any(abs(a - ta) > 0.1 for (a, _), (ta, _) in zip(gap_only, truth2v)), "gap-only should be fooled here"
+
 # cues
 turns = scene.script_turns("{1}a{2}b{1}c{2}d")
 cues = scene.build_cues(turns, spans, audio.shape[1] / SR, "kitchen", "rain")

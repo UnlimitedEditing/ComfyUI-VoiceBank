@@ -48,7 +48,7 @@ class SceneAudioMix:
             scene_prompt="", ambience_label="", voices_json=""):
         wave, sr = _wave(dialogue)
         turns = scene.script_turns(script)
-        spans = scene.find_turns(wave, sr, len(turns))
+        spans = scene.find_turns(wave, sr, len(turns), [sp for sp, _ in turns], [len(t) for _, t in turns])
         voices = {int(k): v for k, v in json.loads(voices_json).items()} if voices_json.strip() else None
         cues = scene.build_cues(turns, spans, wave.shape[1] / sr, scene_prompt, ambience_label, voices, min_pause)
         bed = None

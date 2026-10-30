@@ -67,25 +67,127 @@ def _regions(flags, frame, min_gap):
     return out
 
 
-def find_turns(audio, sr, n_turns):
-    """Split `audio` [C, N] into exactly n_turns spans. Tries finer pause thresholds until there are at least
-    n_turns regions, then merges across the smallest gaps down to n_turns. -> [(t0, t1)]"""
+def _atoms(audio, sr, flags, frame):
+    """Cut the voiced stretches at every pause >= 0.06 s. -> (atom [t0, t1] list, gap-before-each-atom list)."""
+    regions = _regions(flags, frame, 0.05)
+    gaps = [0.0] + [regions[i + 1][0] - regions[i][1] for i in range(len(regions) - 1)]
+    return regions, gaps
+
+
+def _voice_features(audio, sr, regions, bands=24):
+    """One feature row per region: log2 median F0 (autocorrelation, 65-500 Hz) + long-term log spectrum (24 bands to 8 kHz).
+    Rows are z-scored across regions weighted by nothing; F0 gets extra weight (strongest cue between voices)."""
+    mono = audio.mean(axis=0) if audio.ndim == 2 else audio
+    win, hop = int(0.04 * sr), int(0.02 * sr)
+    lo, hi = int(sr / 500), int(sr / 65)
+    edges = np.geomspace(80, min(8000, sr / 2 - 1), bands + 1)
+    freqs = np.fft.rfftfreq(2048, 1 / sr)
+    feats = []
+    for a, b in regions:
+        i0, i1 = int(a * sr), int(b * sr)
+        f0s, spec, n = [], np.zeros(bands), 0
+        for st in range(i0, max(i0 + 1, i1 - win), hop):
+            seg = mono[st:st + win]
+            if len(seg) < win:
+                break
+            seg = seg - seg.mean()
+            e = float(seg @ seg)
+            if e < 1e-6:
+                continue
+            ac = np.fft.irfft(np.abs(np.fft.rfft(seg, 2048)) ** 2)[:hi + 1]
+            if ac[0] > 0 and hi > lo:
+                lag = lo + int(np.argmax(ac[lo:hi + 1]))
+                if ac[lag] / ac[0] > 0.35:
+                    f0s.append(sr / lag)
+            ps = np.abs(np.fft.rfft(seg * np.hanning(win), 2048)) ** 2
+            for k in range(bands):
+                m = (freqs >= edges[k]) & (freqs < edges[k + 1])
+                spec[k] += ps[m].sum() if m.any() else 0.0
+            n += 1
+        spec = np.log10(spec / max(n, 1) + 1e-10)
+        spec -= spec.mean()
+        f0 = np.log2(np.median(f0s)) if len(f0s) >= 2 else np.nan
+        feats.append(np.concatenate([[f0], spec]))
+    feats = np.array(feats, np.float64)
+    f0col = feats[:, 0]
+    if np.isnan(f0col).all():
+        f0col[:] = 0.0
+    f0col[np.isnan(f0col)] = np.nanmedian(f0col)
+    feats[:, 0] = f0col
+    sd = feats.std(axis=0)
+    sd[sd < 1e-6] = 1.0
+    feats = (feats - feats.mean(axis=0)) / sd
+    feats[:, 0] *= 4.0     # pitch dominates
+    return feats
+
+
+def find_turns(audio, sr, n_turns, speakers=None, weights=None):
+    """Split `audio` [C, N] into exactly n_turns spans. -> [(t0, t1)]
+
+    Pauses alone are unreliable (Drama 3 puts 0.2 s between turns and 0.7 s inside one), so when `speakers` (the speaker id of
+    each script turn, in order) is given the voice is used too: speech is cut into atoms at every pause, each atom gets a
+    voice feature, speaker prototypes are re-estimated from the alignment (EM, starting from the character-length prior),
+    and a monotone DP assigns atoms to turns minimising voice distance + a bonus for starting turns at long pauses +
+    a weak penalty for lengths far from `weights` (e.g. characters per turn)."""
     if n_turns < 1:
         raise AlignmentError("the script has no turns")
     flags, frame = _voiced(audio, sr)
-    regions = []
-    for min_gap in (0.30, 0.20, 0.12, 0.08, 0.05):
-        regions = _regions(flags, frame, min_gap)
-        if len(regions) >= n_turns:
-            break
-    if len(regions) < n_turns:
-        raise AlignmentError(f"found {len(regions)} speech regions for {n_turns} script turns")
-    while len(regions) > n_turns:
-        gaps = [regions[i + 1][0] - regions[i][1] for i in range(len(regions) - 1)]
-        i = int(np.argmin(gaps))
-        regions[i][1] = regions[i + 1][1]
-        del regions[i + 1]
-    return [(round(a, 3), round(b, 3)) for a, b in regions]
+    regions, gaps = _atoms(audio, sr, flags, frame)
+    m = len(regions)
+    if m < n_turns:
+        raise AlignmentError(f"found {m} speech regions for {n_turns} script turns")
+    dur = np.array([b - a for a, b in regions])
+    gaps = np.array(gaps)
+    total = regions[-1][1] - regions[0][0]
+    w = np.array(weights if weights is not None else [1.0] * n_turns, np.float64)
+    w = w / w.sum()
+    exp_len = w * total
+    use_voice = speakers is not None and len(set(speakers)) >= 2
+    feats = _voice_features(audio, sr, regions) if use_voice else None
+    mid = np.array([(a + b) / 2 for a, b in regions]) - regions[0][0]
+    # initial assignment: character-length prior
+    bounds = np.cumsum(exp_len)
+    assign = np.minimum(np.searchsorted(bounds, mid), n_turns - 1)
+    BONUS = 1.2     # cost saved per second of pause when a turn starts there (capped at 0.8 s)
+    for _ in range(4 if use_voice else 1):
+        if use_voice:
+            protos = {}
+            for sp in set(speakers):
+                rows = [i for i in range(m) if speakers[assign[i]] == sp]
+                protos[sp] = (np.average(feats[rows], axis=0, weights=dur[rows]) if rows
+                              else feats.mean(axis=0))
+            cost = np.zeros((n_turns, m))
+            for k in range(n_turns):
+                cost[k] = dur * np.linalg.norm(feats - protos[speakers[k]], axis=1)
+        else:
+            cost = np.zeros((n_turns, m))
+        start_cost = -BONUS * np.minimum(gaps, 0.8)          # cost of starting a new turn at atom i
+        inf = 1e18
+        dp = np.full((n_turns, m), inf)
+        back = np.zeros((n_turns, m), np.int8)               # 0 = continue turn, 1 = new turn here
+        dp[0, 0] = cost[0, 0]
+        for i in range(1, m):
+            for k in range(n_turns):
+                stay = dp[k, i - 1]
+                adv = dp[k - 1, i - 1] + start_cost[i] if k else inf
+                if adv < stay:
+                    dp[k, i], back[k, i] = adv + cost[k, i], 1
+                else:
+                    dp[k, i] = stay + cost[k, i]
+        # length prior is applied on the final path only through the EM re-estimate; enforce end state
+        k, path = n_turns - 1, np.zeros(m, int)
+        if dp[k, m - 1] >= inf:
+            raise AlignmentError("could not place all turns")
+        for i in range(m - 1, -1, -1):
+            path[i] = k
+            if back[k, i] == 1:
+                k -= 1
+        assign = path
+    spans = []
+    for k in range(n_turns):
+        idx = [i for i in range(m) if assign[i] == k]
+        spans.append((round(regions[idx[0]][0], 3), round(regions[idx[-1]][1], 3)))
+    return spans
 
 
 def build_cues(turns, spans, total, scene_prompt="", ambience="", voices=None, min_pause=0.25):
